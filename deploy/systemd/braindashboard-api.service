@@ -1,0 +1,18 @@
+[Unit]
+Description=BrainDashboard API
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alex
+Group=alex
+WorkingDirectory=/opt/BrainDashboard
+Environment=PYTHONPATH=/opt/BrainDashboard/src
+EnvironmentFile=/etc/braindashboard/backend.env
+ExecStart=/opt/BrainDashboard/.venv/bin/python -m uvicorn braindashboard.main:app --host ${BRAINDASHBOARD_HOST} --port ${BRAINDASHBOARD_PORT}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

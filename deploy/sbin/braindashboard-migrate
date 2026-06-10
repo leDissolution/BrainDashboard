@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+DEFAULT_ENV_FILE = Path("/etc/braindashboard/backend.env")
+
+
+class ConfigError(Exception):
+    pass
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            raise ConfigError(f"{path}:{line_number}: expected KEY=VALUE")
+
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ConfigError(f"{path}:{line_number}: empty key")
+
+        tokens = shlex.split(raw_value, comments=True, posix=True)
+        if len(tokens) > 1:
+            raise ConfigError(f"{path}:{line_number}: value must be a single shell token")
+        env[key] = tokens[0] if tokens else ""
+
+    return env
+
+
+def main() -> int:
+    repo_root = Path(__file__).resolve().parents[2]
+    alembic_bin = repo_root / ".venv" / "bin" / "alembic"
+    env_file = Path(os.getenv("BRAINDASHBOARD_ENV_FILE", str(DEFAULT_ENV_FILE)))
+
+    if not env_file.is_file():
+        raise ConfigError(f"backend env file not found: {env_file}")
+    if not (repo_root / "alembic.ini").is_file():
+        raise ConfigError(f"repo root does not look valid: {repo_root}")
+    if not alembic_bin.is_file():
+        raise ConfigError(f"alembic executable not found: {alembic_bin}")
+
+    env = os.environ.copy()
+    env.update(parse_env_file(env_file))
+
+    args = sys.argv[1:] or ["upgrade", "head"]
+    completed = subprocess.run([str(alembic_bin), *args], cwd=repo_root, env=env)
+    return completed.returncode
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ConfigError as error:
+        print(f"BrainDashboard: {error}", file=sys.stderr)
+        raise SystemExit(2)

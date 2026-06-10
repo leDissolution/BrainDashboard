@@ -1,0 +1,17 @@
+[Unit]
+Description=BrainDashboard Frontend Dev Server
+After=network-online.target braindashboard-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alex
+Group=alex
+WorkingDirectory=/opt/BrainDashboard/frontend
+EnvironmentFile=/etc/braindashboard/frontend.env
+ExecStart=/usr/bin/npm run dev -- --host ${BRAINDASHBOARD_FRONTEND_HOST} --port ${BRAINDASHBOARD_FRONTEND_PORT}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

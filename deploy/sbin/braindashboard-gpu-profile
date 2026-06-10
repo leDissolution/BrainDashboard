@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+CONFIG_PATH = Path("/etc/braindashboard/gpu-profiles.yaml")
+LACT_SOCKET_PATH = Path("/run/lactd.sock")
+NVIDIA_SMI = "nvidia-smi"
+PROFILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+LACT_TIMEOUT_SECONDS = 5.0
+LACT_SETTLE_SECONDS = 1.0
+ALLOWED_PROFILE_KEYS = {
+    "label",
+    "description",
+    "gpu_index",
+    "lact_device_id",
+    "power_limit_watts",
+    "persistence_mode",
+    "graphics_clocks_mhz",
+    "reset_graphics_clocks",
+    "memory_clocks_mhz",
+    "reset_memory_clocks",
+    "gpu_clock_offsets",
+    "mem_clock_offsets",
+}
+
+
+class ConfigError(Exception):
+    pass
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Apply allowlisted BrainDashboard GPU profiles.")
+    parser.add_argument("command", choices=["list", "apply", "reset"])
+    parser.add_argument("profile", nargs="?")
+    parser.add_argument("--config", default=str(CONFIG_PATH))
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    try:
+        config = load_config(Path(args.config))
+        if args.command == "list":
+            return output(list_profiles(config), args.json)
+        if args.command == "apply":
+            if not args.profile:
+                raise ConfigError("profile name is required")
+            return output(apply_profile(config, args.profile), args.json)
+        return output(reset_gpu(config), args.json)
+    except ConfigError as error:
+        payload = {"status": "failed", "detail": str(error), "commands": []}
+        print(json.dumps(payload) if args.json else str(error), file=sys.stderr)
+        return 2
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise ConfigError(f"config not found: {path}")
+    parsed = parse_mapping_yaml(path.read_text(encoding="utf-8"))
+    profiles = parsed.get("profiles")
+    if not isinstance(profiles, dict):
+        raise ConfigError("config must contain a profiles mapping")
+    return parsed
+
+
+def parse_mapping_yaml(text: str) -> dict[str, Any]:
+    root: dict[str, Any] = {}
+    stack: list[tuple[int, dict[str, Any]]] = [(-1, root)]
+
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = strip_comment(raw_line).rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent % 2:
+            raise ConfigError(f"line {line_number}: indentation must use multiples of two spaces")
+        stripped = line.strip()
+        if ":" not in stripped:
+            raise ConfigError(f"line {line_number}: expected key: value")
+
+        key, value = stripped.split(":", 1)
+        key = key.strip()
+        if not key:
+            raise ConfigError(f"line {line_number}: empty key")
+
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        if not stack:
+            raise ConfigError(f"line {line_number}: invalid indentation")
+
+        parent = stack[-1][1]
+        if value.strip() == "":
+            child: dict[str, Any] = {}
+            parent[key] = child
+            stack.append((indent, child))
+        else:
+            parent[key] = parse_scalar(value.strip())
+
+    return root
+
+
+def strip_comment(line: str) -> str:
+    quote: str | None = None
+    for index, char in enumerate(line):
+        if char in {"'", '"'}:
+            quote = None if quote == char else char if quote is None else quote
+        if char == "#" and quote is None:
+            return line[:index]
+    return line
+
+
+def parse_scalar(value: str) -> object:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    lowered = value.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered in {"null", "none"}:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+def list_profiles(config: dict[str, Any]) -> dict[str, Any]:
+    profiles = config["profiles"]
+    return {
+        "profiles": [normalize_profile(config, name, value) for name, value in profiles.items()]
+    }
+
+
+def apply_profile(config: dict[str, Any], profile_name: str) -> dict[str, Any]:
+    validate_profile_name(profile_name)
+    profiles = config["profiles"]
+    if profile_name not in profiles:
+        raise ConfigError(f"unknown profile: {profile_name}")
+
+    profile = normalize_profile(config, profile_name, profiles[profile_name])
+    commands = build_apply_commands(profile)
+    lact_commands = build_lact_commands(profile)
+    if not commands and not lact_commands:
+        raise ConfigError(f"profile {profile['name']} has no GPU operations")
+
+    run_commands(commands)
+    warnings = apply_lact_offsets(profile) if lact_commands else []
+    final_commands: list[list[str]] = []
+    if lact_commands and not warnings:
+        final_commands = build_post_lact_reassert_commands(commands)
+        time.sleep(LACT_SETTLE_SECONDS)
+        run_commands(final_commands)
+    detail = f"Applied {profile['label']}"
+    if warnings:
+        detail = f"{detail} with warnings"
+    return {
+        "status": "applied",
+        "profile_name": profile_name,
+        "detail": detail,
+        "commands": [
+            format_command(command) for command in commands + lact_commands + final_commands
+        ],
+        "warnings": warnings,
+    }
+
+
+def reset_gpu(config: dict[str, Any]) -> dict[str, Any]:
+    gpu_index = read_int(config, "default_gpu", default=0)
+    commands = [
+        [NVIDIA_SMI, "-i", str(gpu_index), "-rgc"],
+        [NVIDIA_SMI, "-i", str(gpu_index), "-rmc"],
+    ]
+    run_commands(commands)
+    return {
+        "status": "reset",
+        "profile_name": None,
+        "detail": f"Reset clocks on GPU {gpu_index}",
+        "commands": [format_command(command) for command in commands],
+        "warnings": [],
+    }
+
+
+def normalize_profile(config: dict[str, Any], name: str, value: object) -> dict[str, Any]:
+    validate_profile_name(name)
+    if not isinstance(value, dict):
+        raise ConfigError(f"profile {name} must be a mapping")
+    unknown_keys = sorted(set(value) - ALLOWED_PROFILE_KEYS)
+    if unknown_keys:
+        raise ConfigError(f"profile {name} has unsupported keys: {', '.join(unknown_keys)}")
+
+    return {
+        "name": name,
+        "label": read_string(value, "label", default=name),
+        "description": read_string(value, "description", default=""),
+        "gpu_index": read_int(
+            value,
+            "gpu_index",
+            default=read_int(config, "default_gpu", default=0),
+        ),
+        "lact_device_id": read_optional_string(value, "lact_device_id"),
+        "power_limit_watts": read_optional_int(value, "power_limit_watts"),
+        "persistence_mode": read_optional_bool(value, "persistence_mode"),
+        "graphics_clocks_mhz": read_clock_range(value, "graphics_clocks_mhz"),
+        "reset_graphics_clocks": read_bool(value, "reset_graphics_clocks", default=False),
+        "memory_clocks_mhz": read_clock_range(value, "memory_clocks_mhz"),
+        "reset_memory_clocks": read_bool(value, "reset_memory_clocks", default=False),
+        "gpu_clock_offsets": read_offset_map(value, "gpu_clock_offsets"),
+        "mem_clock_offsets": read_offset_map(value, "mem_clock_offsets"),
+    }
+
+
+def build_apply_commands(profile: dict[str, Any]) -> list[list[str]]:
+    gpu_index = str(profile["gpu_index"])
+    commands: list[list[str]] = []
+
+    persistence_mode = profile["persistence_mode"]
+    if persistence_mode is not None:
+        commands.append([NVIDIA_SMI, "-pm", "1" if persistence_mode else "0"])
+    if profile["power_limit_watts"] is not None:
+        commands.append([NVIDIA_SMI, "-i", gpu_index, "-pl", str(profile["power_limit_watts"])])
+    if profile["reset_graphics_clocks"]:
+        commands.append([NVIDIA_SMI, "-i", gpu_index, "-rgc"])
+    if profile["graphics_clocks_mhz"] is not None:
+        clock_range = profile["graphics_clocks_mhz"]
+        commands.append([NVIDIA_SMI, "-i", gpu_index, "-lgc", format_clock_range(clock_range)])
+    if profile["reset_memory_clocks"]:
+        commands.append([NVIDIA_SMI, "-i", gpu_index, "-rmc"])
+    if profile["memory_clocks_mhz"] is not None:
+        clock_range = profile["memory_clocks_mhz"]
+        commands.append([NVIDIA_SMI, "-i", gpu_index, "-lmc", format_clock_range(clock_range)])
+
+    return commands
+
+
+def build_lact_commands(profile: dict[str, Any]) -> list[list[str]]:
+    if profile["gpu_clock_offsets"] is None and profile["mem_clock_offsets"] is None:
+        return []
+
+    target = profile["lact_device_id"] or f"gpu_index:{profile['gpu_index']}"
+    return [["lact-api", LACT_SOCKET_PATH.as_posix(), "batch-set-clocks", target]]
+
+
+def build_post_lact_reassert_commands(commands: list[list[str]]) -> list[list[str]]:
+    return [command for command in commands if not is_clock_command(command)]
+
+
+def is_clock_command(command: list[str]) -> bool:
+    return any(option in command for option in {"-lgc", "-lmc", "-rgc", "-rmc"})
+
+
+def run_commands(commands: list[list[str]]) -> None:
+    for command in commands:
+        try:
+            subprocess.run(command, capture_output=True, check=True, text=True, timeout=20)
+        except FileNotFoundError as error:
+            raise ConfigError("nvidia-smi was not found") from error
+        except subprocess.TimeoutExpired as error:
+            raise ConfigError(f"command timed out: {format_command(command)}") from error
+        except subprocess.CalledProcessError as error:
+            detail = (error.stderr or error.stdout or "command failed").strip()
+            raise ConfigError(f"{format_command(command)} failed: {detail}") from error
+
+
+def apply_lact_offsets(profile: dict[str, Any]) -> list[str]:
+    try:
+        device_id = resolve_lact_device_id(profile)
+        commands = build_lact_clock_commands(profile)
+        if commands:
+            lact_request("batch_set_clocks_value", {"id": device_id, "commands": commands})
+            lact_request("confirm_pending_config", {"command": "confirm"})
+    except ConfigError as error:
+        return [f"LACT offsets were not applied: {error}"]
+
+    return []
+
+
+def build_lact_clock_commands(profile: dict[str, Any]) -> list[dict[str, object]]:
+    commands: list[dict[str, object]] = []
+
+    if profile["gpu_clock_offsets"] is not None:
+        commands.extend(
+            {
+                "type": {"gpu_clock_offset": pstate},
+                "value": offset,
+            }
+            for pstate, offset in profile["gpu_clock_offsets"].items()
+        )
+    if profile["mem_clock_offsets"] is not None:
+        commands.extend(
+            {
+                "type": {"mem_clock_offset": pstate},
+                "value": offset,
+            }
+            for pstate, offset in profile["mem_clock_offsets"].items()
+        )
+    return commands
+
+
+def resolve_lact_device_id(profile: dict[str, Any]) -> str:
+    device_id = profile["lact_device_id"]
+    if device_id:
+        return device_id
+
+    devices = lact_request("list_devices")
+    if not isinstance(devices, list):
+        raise ConfigError("LACT returned an invalid device list")
+
+    selectable_devices = [
+        device
+        for device in devices
+        if isinstance(device, dict) and device.get("device_type") == "Dedicated"
+    ]
+    if not selectable_devices:
+        selectable_devices = devices
+
+    gpu_index = profile["gpu_index"]
+    if gpu_index < 0 or gpu_index >= len(selectable_devices):
+        raise ConfigError(f"LACT device not found for GPU index {gpu_index}")
+
+    device = selectable_devices[gpu_index]
+    if not isinstance(device, dict) or not isinstance(device.get("id"), str):
+        raise ConfigError(f"LACT device {gpu_index} is missing an id")
+    return device["id"]
+
+
+def lact_request(command: str, args: dict[str, Any] | None = None) -> object:
+    payload: dict[str, Any] = {"command": command}
+    if args is not None:
+        payload["args"] = args
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(LACT_TIMEOUT_SECONDS)
+            client.connect(str(LACT_SOCKET_PATH))
+            client.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            response = read_socket_response(client)
+    except FileNotFoundError as error:
+        raise ConfigError(f"LACT socket was not found at {LACT_SOCKET_PATH}") from error
+    except TimeoutError as error:
+        raise ConfigError("LACT request timed out") from error
+    except OSError as error:
+        raise ConfigError(f"LACT request failed: {error}") from error
+
+    try:
+        parsed = json.loads(response)
+    except json.JSONDecodeError as error:
+        raise ConfigError("LACT returned invalid JSON") from error
+
+    if not isinstance(parsed, dict):
+        raise ConfigError("LACT returned an invalid response")
+    if parsed.get("status") != "ok":
+        detail = parsed.get("data")
+        raise ConfigError(str(detail or "LACT returned an error"))
+    return parsed.get("data")
+
+
+def read_socket_response(client: socket.socket) -> str:
+    chunks: list[bytes] = []
+    while True:
+        chunk = client.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        if b"\n" in chunk:
+            break
+
+    if not chunks:
+        raise ConfigError("LACT returned an empty response")
+    return b"".join(chunks).split(b"\n", 1)[0].decode("utf-8")
+
+
+def validate_profile_name(name: str) -> None:
+    if not PROFILE_NAME_PATTERN.fullmatch(name):
+        raise ConfigError(f"invalid profile name: {name}")
+
+
+def read_string(payload: dict[str, Any], key: str, default: str) -> str:
+    value = payload.get(key, default)
+    if not isinstance(value, str):
+        raise ConfigError(f"{key} must be a string")
+    return value
+
+
+def read_optional_string(payload: dict[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(f"{key} must be a string")
+    return value
+
+
+def read_int(payload: dict[str, Any], key: str, default: int) -> int:
+    value = payload.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{key} must be an integer")
+    return value
+
+
+def read_optional_int(payload: dict[str, Any], key: str) -> int | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{key} must be an integer")
+    return value
+
+
+def read_bool(payload: dict[str, Any], key: str, default: bool) -> bool:
+    value = payload.get(key, default)
+    if not isinstance(value, bool):
+        raise ConfigError(f"{key} must be true or false")
+    return value
+
+
+def read_optional_bool(payload: dict[str, Any], key: str) -> bool | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ConfigError(f"{key} must be true or false")
+    return value
+
+
+def read_clock_range(payload: dict[str, Any], key: str) -> dict[str, int] | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ConfigError(f"{key} must contain min and max")
+    minimum = read_int(value, "min", default=-1)
+    maximum = read_int(value, "max", default=-1)
+    if minimum < 0 or maximum < 0 or minimum > maximum:
+        raise ConfigError(f"{key} must have non-negative min <= max")
+    return {"min": minimum, "max": maximum}
+
+
+def read_offset_map(payload: dict[str, Any], key: str) -> dict[int, int] | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ConfigError(f"{key} must be a pstate-to-offset mapping")
+
+    offsets: dict[int, int] = {}
+    for raw_pstate, raw_offset in value.items():
+        try:
+            pstate = int(raw_pstate)
+        except (TypeError, ValueError) as error:
+            raise ConfigError(f"{key} pstate keys must be integers") from error
+        if pstate < 0:
+            raise ConfigError(f"{key} pstate keys must be non-negative")
+        if isinstance(raw_offset, bool) or not isinstance(raw_offset, int):
+            raise ConfigError(f"{key} offsets must be integers")
+        offsets[pstate] = raw_offset
+    return offsets
+
+
+def format_clock_range(clock_range: dict[str, int]) -> str:
+    return f"{clock_range['min']},{clock_range['max']}"
+
+
+def format_command(command: list[str]) -> str:
+    return " ".join(command)
+
+
+def output(payload: dict[str, Any], as_json: bool) -> int:
+    if as_json:
+        print(json.dumps(payload))
+    else:
+        print(payload.get("detail") or json.dumps(payload))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

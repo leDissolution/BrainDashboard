@@ -1,0 +1,1 @@
+alex ALL=(root) NOPASSWD: /usr/local/sbin/braindashboard-gpu-profile *

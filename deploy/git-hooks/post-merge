@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -u
+
+services=(
+  braindashboard-api.service
+  braindashboard-frontend.service
+)
+
+systemctl_path=/usr/bin/systemctl
+if [[ ! -x "$systemctl_path" ]]; then
+  echo "BrainDashboard: systemctl not found; skipping service restart."
+  exit 0
+fi
+
+restart_failed=0
+echo "BrainDashboard: restarting services after git pull..."
+
+for service in "${services[@]}"; do
+  if sudo -n "$systemctl_path" restart "$service"; then
+    echo "BrainDashboard: restarted $service"
+  else
+    restart_failed=1
+    echo "BrainDashboard: could not restart $service with passwordless sudo."
+  fi
+done
+
+if [[ "$restart_failed" -ne 0 ]]; then
+  echo "BrainDashboard: run sudo systemctl restart ${services[*]} or install the sudoers template."
+fi
+
+exit 0

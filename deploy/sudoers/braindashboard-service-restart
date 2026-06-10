@@ -1,0 +1,1 @@
+alex ALL=(root) NOPASSWD: /usr/bin/systemctl restart braindashboard-api.service, /usr/bin/systemctl restart braindashboard-frontend.service

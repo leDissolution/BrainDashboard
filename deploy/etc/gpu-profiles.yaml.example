@@ -1,0 +1,40 @@
+default_gpu: 0
+
+profiles:
+  inference-quiet:
+    label: Inference Quiet
+    description: Lower power and steady clocks for local inference.
+    power_limit_watts: 190
+    persistence_mode: true
+    graphics_clocks_mhz:
+      min: 900
+      max: 1500
+
+  balanced:
+    label: Balanced
+    description: Normal daily operating profile with default graphics clocks.
+    power_limit_watts: 260
+    persistence_mode: true
+    reset_graphics_clocks: true
+
+  training-burst:
+    label: Training Burst
+    description: Higher power ceiling for short training or eval bursts.
+    power_limit_watts: 320
+    persistence_mode: true
+    reset_graphics_clocks: true
+
+  training-offset:
+    label: Training Offset
+    description: Applies normal NVIDIA controls, then best-effort LACT clock offsets.
+    power_limit_watts: 300
+    persistence_mode: true
+    graphics_clocks_mhz:
+      min: 1200
+      max: 2100
+    # Optional. If omitted, the wrapper asks LACT for its device list and uses gpu_index.
+    # lact_device_id: 10DE:2704-1462:5110-0000:09:00.0
+    gpu_clock_offsets:
+      0: -100
+    mem_clock_offsets:
+      0: 200
